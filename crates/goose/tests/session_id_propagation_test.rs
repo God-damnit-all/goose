@@ -4,9 +4,16 @@ use goose::providers::api_client::{ApiClient, AuthMethod};
 use goose::providers::base::Provider;
 use goose::providers::openai::OpenAiProvider;
 use goose::session_context::SESSION_ID_HEADER;
+use opentelemetry::logs::AnyValue;
+use opentelemetry::trace::TracerProvider;
+use opentelemetry::{Key, KeyValue};
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLoggerProvider};
+use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::Mutex;
+use tracing_subscriber::prelude::*;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -54,7 +61,6 @@ async fn setup_mock_server() -> (MockServer, HeaderCapture, Box<dyn Provider>) {
         .and(path("/v1/chat/completions"))
         .respond_with(move |req: &Request| {
             capture_clone.capture_session_header(req);
-            // Return SSE streaming format
             let sse_response = format!(
                 "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
                 json!({
@@ -102,6 +108,60 @@ async fn make_request(provider: &dyn Provider, session_id: &str) {
         )
         .await
         .unwrap();
+}
+
+#[test]
+fn test_session_id_propagates_to_log_records() {
+    use goose::otel::otlp::SessionIdBridge;
+
+    let exporter = InMemoryLogExporter::default();
+    let provider = SdkLoggerProvider::builder()
+        .with_log_processor(SessionIdBridge)
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let bridge = OpenTelemetryTracingBridge::new(&provider);
+    let subscriber = tracing_subscriber::registry()
+        .with(SessionIdBridge)
+        .with(bridge);
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let span = tracing::info_span!("test", session.id = "abc-123");
+    let _enter = span.enter();
+    tracing::info!("hello");
+
+    provider.force_flush().unwrap();
+    let logs = exporter.get_emitted_logs().unwrap();
+    assert_eq!(logs.len(), 1);
+    let attrs: Vec<(Key, AnyValue)> = logs[0].record.attributes_iter().cloned().collect();
+    assert!(attrs.contains(&(Key::new("session.id"), AnyValue::String("abc-123".into()))));
+}
+
+#[test]
+fn test_complete_span_has_session_id() {
+    let exporter = InMemorySpanExporter::default();
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("test"));
+    let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+    let _guard = tracing::subscriber::set_default(subscriber);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (_, _, llm_provider) = setup_mock_server().await;
+            make_request(llm_provider.as_ref(), "test-session").await;
+        });
+
+    tracer_provider.force_flush().unwrap();
+    let spans = exporter.get_finished_spans().unwrap();
+    let complete = spans.iter().find(|s| s.name == "complete").unwrap();
+
+    assert!(complete
+        .attributes
+        .contains(&KeyValue::new("session.id", "test-session")));
 }
 
 #[tokio::test]
